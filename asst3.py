@@ -16,7 +16,17 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neural_network import MLPClassifier
 import warnings
 import os
+import sys
 warnings.filterwarnings('ignore')
+
+# Add VGGish to path (make sure you have the vggish files in your directory)
+sys.path.append('.')
+try:
+    from vggish_input import waveform_to_examples
+    VGGISH_AVAILABLE = True
+except ImportError:
+    print("Warning: VGGish not available, using fallback feature extraction")
+    VGGISH_AVAILABLE = False
 
 
 class AudioFeatureExtractor:
@@ -26,7 +36,7 @@ class AudioFeatureExtractor:
         self.sample_rate = sample_rate
 
     def extract_fft(self, audio_signal, sr=16000):
-        """Extract FFT features"""
+        """Extract FFT features for ML model"""
         windowed_signal = audio_signal * \
             librosa.filters.get_window('hann', len(audio_signal))
         stft = librosa.stft(windowed_signal)
@@ -53,13 +63,12 @@ class AudioFeatureExtractor:
                 band_energy = 0
             band_energies.append(band_energy)
 
-        features = np.array([
-            total_energy, spectral_centroid, spectral_spread, spectral_rolloff, *band_energies
-        ])
+        features = np.array([total_energy, spectral_centroid,
+                            spectral_spread, spectral_rolloff, *band_energies])
         return features
 
     def extract_mfcc(self, audio_signal, sr=16000):
-        """Extract MFCC features"""
+        """Extract MFCC features for ML model"""
         mfccs = librosa.feature.mfcc(y=audio_signal, sr=sr, n_mfcc=13)
         delta_mfccs = librosa.feature.delta(mfccs)
         delta2_mfccs = librosa.feature.delta(mfccs, order=2)
@@ -77,7 +86,7 @@ class AudioFeatureExtractor:
         return selected_features
 
     def extract_rms(self, audio_signal, sr=16000):
-        """Extract RMS energy features"""
+        """Extract RMS energy features for ML model"""
         rms_energy = librosa.feature.rms(y=audio_signal)[0]
 
         rms_mean = np.mean(rms_energy)
@@ -112,71 +121,59 @@ class AudioFeatureExtractor:
         return combined_features
 
     def extract_vggish_features(self, audio_signal):
-        """Extract VGGish-style features for DL model"""
-        # For this demo, we'll use mel spectrograms as a proxy for VGGish features
+        """Extract VGGish features exactly like Ubicoustics does"""
+        if VGGISH_AVAILABLE:
+            # Convert to the same format as Ubicoustics
+            # Ensure audio is float32 in [-1, 1] range
+            if audio_signal.dtype != np.float32:
+                audio_signal = audio_signal.astype(np.float32)
+
+            # Normalize to [-1, 1] if needed
+            if np.max(np.abs(audio_signal)) > 1.0:
+                audio_signal = audio_signal / np.max(np.abs(audio_signal))
+
+            # Use VGGish preprocessing exactly like Ubicoustics
+            examples = waveform_to_examples(audio_signal, self.sample_rate)
+
+            if examples.shape[0] == 0:
+                # If no examples generated, create dummy data
+                examples = np.zeros((1, 96, 64))
+
+            # Reshape to match Ubicoustics format: (n_examples, 96, 64, 1)
+            examples = examples.reshape(len(examples), 96, 64, 1)
+
+            return examples
+        else:
+            # Fallback if VGGish not available
+            return self.extract_vggish_features_fallback(audio_signal)
+
+    def extract_vggish_features_fallback(self, audio_signal):
+        """Fallback VGGish-style features if vggish_input not available"""
         mel_spec = librosa.feature.melspectrogram(
             y=audio_signal,
             sr=self.sample_rate,
             n_mels=64,
-            fmax=8000
+            fmax=8000,
+            hop_length=160,
+            n_fft=512
         )
+
         log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
 
-        # Resize to fixed size (similar to VGGish input)
         target_frames = 96
         if log_mel_spec.shape[1] < target_frames:
-            # Pad if too short
             pad_width = target_frames - log_mel_spec.shape[1]
             log_mel_spec = np.pad(
-                log_mel_spec, ((0, 0), (0, pad_width)), 'constant')
+                log_mel_spec, ((0, 0), (0, pad_width)), 'constant', constant_values=-80)
         elif log_mel_spec.shape[1] > target_frames:
-            # Truncate if too long
             log_mel_spec = log_mel_spec[:, :target_frames]
 
-        # Reshape to match expected input format
-        features = log_mel_spec.T.flatten()  # Flatten for simplicity
-        return features
+        features = log_mel_spec.T
+        features = np.expand_dims(features, axis=-1)
+        features = (features - np.mean(features)) / (np.std(features) + 1e-8)
 
-
-class DummyUbicousticsModel:
-    """Dummy model to simulate Ubicoustics behavior"""
-
-    def __init__(self, activities):
-        self.activities = activities
-        self.n_classes = len(activities)
-        # Simple neural network for demo
-        self.model = keras.Sequential([
-            keras.layers.Dense(128, activation='relu',
-                               input_shape=(6144,)),  # 64*96 flattened
-            keras.layers.Dropout(0.3),
-            keras.layers.Dense(64, activation='relu'),
-            keras.layers.Dropout(0.3),
-            keras.layers.Dense(self.n_classes, activation='softmax')
-        ])
-        self.model.compile(
-            optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-
-        # Initialize with random weights (in real scenario, load pre-trained weights)
-        dummy_input = np.random.randn(1, 6144)
-        _ = self.model.predict(dummy_input, verbose=0)
-
-    def predict(self, features):
-        """Predict activity probabilities"""
-        if len(features.shape) == 1:
-            features = features.reshape(1, -1)
-
-        # Ensure correct input size
-        if features.shape[1] != 6144:
-            # Resize or pad to expected size
-            if features.shape[1] < 6144:
-                pad_width = 6144 - features.shape[1]
-                features = np.pad(
-                    features, ((0, 0), (0, pad_width)), 'constant')
-            else:
-                features = features[:, :6144]
-
-        probs = self.model.predict(features, verbose=0)
-        return probs[0]
+        # Return in batch format like VGGish
+        return np.expand_dims(features, axis=0)
 
 
 class RealTimeAudioClassifier:
@@ -190,14 +187,44 @@ class RealTimeAudioClassifier:
         self.window_samples = int(self.window_duration * self.sample_rate)
         self.hop_samples = int(self.hop_duration * self.sample_rate)
 
-        # Activities
+        # Activities - your 5 classes
         self.activities = ['laugh', 'cough', 'clap', 'knock', 'alarm']
+
+        # Ubicoustics labels (30 classes)
+        self.ubicoustics_labels = {
+            'dog-bark': 0, 'drill': 1, 'hazard-alarm': 2, 'phone-ring': 3, 'speech': 4,
+            'vacuum': 5, 'baby-cry': 6, 'chopping': 7, 'cough': 8, 'door': 9,
+            'water-running': 10, 'knock': 11, 'microwave': 12, 'shaver': 13, 'toothbrush': 14,
+            'blender': 15, 'dishwasher': 16, 'doorbell': 17, 'flush': 18, 'hair-dryer': 19,
+            'laugh': 20, 'snore': 21, 'typing': 22, 'hammer': 23, 'car-horn': 24,
+            'engine': 25, 'saw': 26, 'cat-meow': 27, 'alarm-clock': 28, 'cooking': 29
+        }
+
+        # Human readable labels for Ubicoustics
+        self.ubicoustics_human_labels = {
+            0: "Dog Barking", 1: "Drill In-Use", 2: "Hazard Alarm", 3: "Phone Ringing",
+            4: "Person Talking", 5: "Vacuum In-Use", 6: "Baby Crying", 7: "Chopping",
+            8: "Coughing", 9: "Door In-Use", 10: "Water Running", 11: "Knocking",
+            12: "Microwave In-Use", 13: "Shaver In-Use", 14: "Toothbrushing", 15: "Blender In-Use",
+            16: "Dishwasher In-Use", 17: "Doorbell In-Use", 18: "Toilet Flushing", 19: "Hair Dryer In-Use",
+            20: "Laughing", 21: "Snoring", 22: "Typing", 23: "Hammering", 24: "Car Honking",
+            25: "Vehicle Running", 26: "Saw In-Use", 27: "Cat Meowing", 28: "Alarm Clock", 29: "Utensils and Cutlery"
+        }
+
+        # Mapping from Ubicoustics classes to your activities
+        self.ubicoustics_to_activity = {
+            20: 0,  # laugh -> laugh
+            8: 1,   # cough -> cough
+            11: 2,  # knock -> clap (closest match)
+            11: 3,  # knock -> knock
+            2: 4,   # hazard-alarm -> alarm
+            28: 4   # alarm-clock -> alarm
+        }
 
         # Feature extractor
         self.feature_extractor = AudioFeatureExtractor(self.sample_rate)
 
         # Audio buffer
-        # Keep 3 seconds of audio
         self.audio_buffer = deque(maxlen=self.window_samples * 3)
         self.audio_queue = queue.Queue()
 
@@ -216,6 +243,10 @@ class RealTimeAudioClassifier:
         self.is_recording = False
         self.is_processing = False
 
+        # Prediction thresholds (like in Ubicoustics)
+        self.prediction_threshold = 0.5
+        self.db_threshold = -40
+
         # Initialize GUI
         self.setup_gui()
 
@@ -225,9 +256,10 @@ class RealTimeAudioClassifier:
             try:
                 with open(model_path, 'rb') as f:
                     model_data = pickle.load(f)
+                    print(f"Loaded ML model from {model_path}")
                     return model_data['model'], model_data['scaler']
-            except:
-                print("Could not load ML model, creating dummy model")
+            except Exception as e:
+                print(f"Could not load ML model: {e}")
 
         # Create dummy ML model for demonstration
         print("Creating dummy ML model...")
@@ -250,16 +282,47 @@ class RealTimeAudioClassifier:
         return model, scaler
 
     def load_dl_model(self, model_path):
-        """Load or create DL model"""
+        """Load DL model (Ubicoustics)"""
         if model_path and os.path.exists(model_path):
             try:
-                return keras.models.load_model(model_path)
-            except:
-                print("Could not load DL model, creating dummy model")
+                model = keras.models.load_model(model_path)
+                print(f"Loaded DL model from {model_path}")
+                print(f"Model input shape: {model.input_shape}")
+                print(f"Model output shape: {model.output_shape}")
+                return model
+            except Exception as e:
+                print(f"Could not load DL model: {e}")
 
-        # Create dummy DL model for demonstration
-        print("Creating dummy DL model...")
-        return DummyUbicousticsModel(self.activities)
+        print("Warning: No valid DL model found. Please provide the path to your Ubicoustics model.")
+        return None
+
+    def map_ubicoustics_to_activities(self, ubicoustics_probs):
+        """Map 30-class Ubicoustics predictions to 5-class activity predictions"""
+        activity_probs = np.zeros(len(self.activities))
+
+        # Direct mapping for classes that match
+        for ubicoustics_idx, activity_idx in self.ubicoustics_to_activity.items():
+            if ubicoustics_idx < len(ubicoustics_probs):
+                activity_probs[activity_idx] += ubicoustics_probs[ubicoustics_idx]
+
+        # For clap, we don't have a direct match, so we use knock as proxy
+        # clap gets knock probability
+        activity_probs[2] = ubicoustics_probs[11]
+
+        # Normalize probabilities
+        if np.sum(activity_probs) > 0:
+            activity_probs = activity_probs / np.sum(activity_probs)
+
+        return activity_probs
+
+    def compute_audio_level_db(self, audio_data):
+        """Compute audio level in dB like Ubicoustics"""
+        rms = np.sqrt(np.mean(audio_data**2))
+        if rms > 0:
+            db = 20 * np.log10(rms)
+        else:
+            db = -80  # Very quiet
+        return db
 
     def setup_gui(self):
         """Setup the matplotlib GUI"""
@@ -337,6 +400,9 @@ class RealTimeAudioClassifier:
                 # Get audio data from queue
                 audio_data = self.audio_queue.get(timeout=0.1)
 
+                # Compute audio level
+                audio_db = self.compute_audio_level_db(audio_data)
+
                 # ML Model Processing
                 start_time = time.time()
                 try:
@@ -356,21 +422,45 @@ class RealTimeAudioClassifier:
                     ml_probs = np.zeros(len(self.activities))
                     ml_time = 0
 
-                # DL Model Processing
+                # DL Model Processing (Ubicoustics style)
                 start_time = time.time()
-                try:
-                    dl_features = self.feature_extractor.extract_vggish_features(
-                        audio_data)
-                    dl_probs = self.dl_model.predict(dl_features)
-                    dl_prediction = np.argmax(dl_probs)
-                    dl_confidence = dl_probs[dl_prediction]
-                    dl_time = (time.time() - start_time) * 1000  # ms
-                except Exception as e:
-                    print(f"DL processing error: {e}")
-                    dl_prediction = 0
-                    dl_confidence = 0.0
-                    dl_probs = np.zeros(len(self.activities))
-                    dl_time = 0
+                dl_prediction = 0
+                dl_confidence = 0.0
+                dl_probs = np.zeros(len(self.activities))
+                dl_time = 0
+
+                if self.dl_model is not None:
+                    try:
+                        # Extract VGGish features exactly like Ubicoustics
+                        vggish_examples = self.feature_extractor.extract_vggish_features(
+                            audio_data)
+
+                        if vggish_examples.shape[0] > 0:
+                            # Make prediction with Ubicoustics model
+                            ubicoustics_predictions = self.dl_model.predict(
+                                vggish_examples, verbose=0)
+
+                            # Average predictions across all examples
+                            avg_ubicoustics_pred = np.mean(
+                                ubicoustics_predictions, axis=0)
+
+                            # Map to your 5 activities
+                            dl_probs = self.map_ubicoustics_to_activities(
+                                avg_ubicoustics_pred)
+                            dl_prediction = np.argmax(dl_probs)
+                            dl_confidence = dl_probs[dl_prediction]
+
+                            # Apply thresholds like Ubicoustics
+                            if dl_confidence < self.prediction_threshold or audio_db < self.db_threshold:
+                                dl_prediction = -1  # No prediction
+                                dl_confidence = 0.0
+
+                        dl_time = (time.time() - start_time) * 1000  # ms
+
+                    except Exception as e:
+                        print(f"DL processing error: {e}")
+                        import traceback
+                        traceback.print_exc()
 
                 # Store results
                 current_time = time.time()
@@ -399,8 +489,11 @@ class RealTimeAudioClassifier:
             time_axis = np.linspace(0, self.window_duration, len(audio_data))
             self.line_waveform.set_data(time_axis, audio_data)
             self.ax_waveform.set_xlim(0, self.window_duration)
-            self.ax_waveform.set_ylim(
-                np.min(audio_data) * 1.1, np.max(audio_data) * 1.1)
+
+            # Auto-scale y-axis
+            if np.max(np.abs(audio_data)) > 0:
+                self.ax_waveform.set_ylim(
+                    np.min(audio_data) * 1.1, np.max(audio_data) * 1.1)
 
         # Update ML predictions
         self.ax_ml.clear()
@@ -410,12 +503,11 @@ class RealTimeAudioClassifier:
         self.ax_ml.set_yticklabels(self.activities)
 
         if self.ml_results:
-            recent_ml = list(self.ml_results)[-20:]  # Last 20 predictions
+            recent_ml = list(self.ml_results)[-20:]
             ml_preds = [r[0] for r in recent_ml]
             ml_confs = [r[1] for r in recent_ml]
             x_pos = range(len(ml_preds))
 
-            # Color by confidence
             colors = plt.cm.viridis(ml_confs)
             self.ax_ml.scatter(x_pos, ml_preds, c=colors, s=50)
 
@@ -428,23 +520,26 @@ class RealTimeAudioClassifier:
         self.ax_dl.clear()
         self.ax_dl.set_title('DL Model Predictions')
         self.ax_dl.set_ylabel('Activity')
-        self.ax_dl.set_yticks(range(len(self.activities)))
-        self.ax_dl.set_yticklabels(self.activities)
+        self.ax_dl.set_yticks(range(-1, len(self.activities)))
+        self.ax_dl.set_yticklabels(['No Pred'] + self.activities)
 
         if self.dl_results:
-            recent_dl = list(self.dl_results)[-20:]  # Last 20 predictions
+            recent_dl = list(self.dl_results)[-20:]
             dl_preds = [r[0] for r in recent_dl]
             dl_confs = [r[1] for r in recent_dl]
             x_pos = range(len(dl_preds))
 
-            # Color by confidence
             colors = plt.cm.plasma(dl_confs)
             self.ax_dl.scatter(x_pos, dl_preds, c=colors, s=50)
 
             if dl_preds:
                 latest_dl = recent_dl[-1]
-                self.ax_dl.set_title(
-                    f'DL: {self.activities[latest_dl[0]]} ({latest_dl[1]:.2f})')
+                if latest_dl[0] >= 0:
+                    self.ax_dl.set_title(
+                        f'DL: {self.activities[latest_dl[0]]} ({latest_dl[1]:.2f})')
+                else:
+                    self.ax_dl.set_title(
+                        f'DL: No Prediction ({latest_dl[1]:.2f})')
 
         # Update confidence comparison
         self.ax_confidence.clear()
@@ -458,25 +553,32 @@ class RealTimeAudioClassifier:
             latest_ml_probs = self.ml_results[-1][2]
             latest_dl_probs = self.dl_results[-1][2]
 
-            x_pos = np.arange(len(self.activities))
-            width = 0.35
+            if len(latest_ml_probs) == len(self.activities) and len(latest_dl_probs) == len(self.activities):
+                x_pos = np.arange(len(self.activities))
+                width = 0.35
 
-            self.ax_confidence.bar(x_pos - width/2, latest_ml_probs, width,
-                                   label='ML Model', alpha=0.8, color='blue')
-            self.ax_confidence.bar(x_pos + width/2, latest_dl_probs, width,
-                                   label='DL Model', alpha=0.8, color='red')
-            self.ax_confidence.legend()
-            self.ax_confidence.set_ylim(0, 1)
+                self.ax_confidence.bar(x_pos - width/2, latest_ml_probs, width,
+                                       label='ML Model', alpha=0.8, color='blue')
+                self.ax_confidence.bar(x_pos + width/2, latest_dl_probs, width,
+                                       label='DL Model', alpha=0.8, color='red')
+                self.ax_confidence.legend()
+                self.ax_confidence.set_ylim(0, 1)
 
         # Update status
         if self.ml_times and self.dl_times:
             avg_ml_time = np.mean(list(self.ml_times)[-10:])
             avg_dl_time = np.mean(list(self.dl_times)[-10:])
 
-            self.ml_info_text.set_text(
-                f'ML: {self.activities[self.ml_results[-1][0]]} ({avg_ml_time:.1f} ms)')
-            self.dl_info_text.set_text(
-                f'DL: {self.activities[self.dl_results[-1][0]]} ({avg_dl_time:.1f} ms)')
+            if self.ml_results:
+                self.ml_info_text.set_text(
+                    f'ML: {self.activities[self.ml_results[-1][0]]} ({avg_ml_time:.1f} ms)')
+
+            if self.dl_results and self.dl_results[-1][0] >= 0:
+                self.dl_info_text.set_text(
+                    f'DL: {self.activities[self.dl_results[-1][0]]} ({avg_dl_time:.1f} ms)')
+            else:
+                self.dl_info_text.set_text(
+                    f'DL: No Prediction ({avg_dl_time:.1f} ms)')
 
         return []
 
@@ -522,6 +624,8 @@ class RealTimeAudioClassifier:
         """Run the real-time classifier"""
         print("Real-Time Audio Classifier")
         print("Activities:", self.activities)
+        if self.dl_model is None:
+            print("WARNING: No DL model loaded. Only ML predictions will be available.")
         print("Click 'Start' to begin recording and classification")
         print("Click 'Stop' to end recording")
         print("Close the window to exit")
@@ -539,9 +643,10 @@ def main():
     """Main function"""
     import os
 
-    # Paths to your trained models (update these paths)
-    ml_model_path = "ml_model.pkl"  # Path to your saved ML model
-    dl_model_path = "dl_model.h5"   # Path to your saved DL model
+    # Paths to your trained models
+    ml_model_path = "ml_model.pkl"  # Path to your ML model from Assignment 1
+    # Path to your Ubicoustics model from Assignment 2
+    dl_model_path = "models/ubicoustics_model.h5"
 
     # Check if models exist
     if not os.path.exists(ml_model_path):
@@ -549,7 +654,8 @@ def main():
         ml_model_path = None
 
     if not os.path.exists(dl_model_path):
-        print(f"DL model not found at {dl_model_path}, will use dummy model")
+        print(f"DL model not found at {dl_model_path}")
+        print("Please provide the path to your Ubicoustics model from Assignment 2")
         dl_model_path = None
 
     # Create and run classifier
