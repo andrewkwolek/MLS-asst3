@@ -1,3 +1,4 @@
+import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -1497,3 +1498,83 @@ def test_hyperparameter_tuning():
 
 
 test_hyperparameter_tuning()
+
+# Add this code to the end of your Assignment 1 notebook
+# After your hyperparameter tuning section
+
+
+def save_best_ml_model():
+    """
+    Train and save the best ML model from Assignment 1
+    """
+    # Define the path to your dataset directory
+    dataset_path = f"/content/drive/MyDrive/{dataset_id}"
+
+    print("Training and saving the best ML model...")
+
+    # Load and process all your data (same as in previous sections)
+    audio_files = list_audio_files(dataset_path)
+    X, y, metadata = process_dataset(
+        audio_files,
+        feature_types=['fft', 'mfcc', 'rms'],  # All features
+        window_size=None  # Use whole file (best performing from A1.4)
+    )
+
+    # Create the best model from your hyperparameter tuning results
+    # Use the optimal parameters you found in A1.5
+    best_model = MLPClassifier(
+        hidden_layer_sizes=(100,),  # Use your best parameters here
+        activation='relu',           # Use your best parameters here
+        alpha=0.0001,               # Use your best parameters here
+        learning_rate='constant',    # Use your best parameters here
+        max_iter=1000,
+        random_state=42
+    )
+
+    # Prepare the scaler
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Train the final model on ALL your data
+    best_model.fit(X_scaled, y)
+
+    # Save the model, scaler, and metadata
+    model_data = {
+        'model': best_model,
+        'scaler': scaler,
+        'activities': ACTIVITIES,
+        'window_size': None
+    }
+
+    # Save to pickle file
+    model_path = f"/content/drive/MyDrive/ml_model.pkl"
+    with open(model_path, 'wb') as f:
+        pickle.dump(model_data, f)
+
+    print(f"Model saved to: {model_path}")
+    print(f"Model trained on {len(X)} samples")
+    print(f"Feature vector size: {X.shape[1]}")
+    print(f"Activities: {ACTIVITIES}")
+
+    # Test loading the model
+    print("\nTesting model loading...")
+    with open(model_path, 'rb') as f:
+        loaded_data = pickle.load(f)
+
+    loaded_model = loaded_data['model']
+    loaded_scaler = loaded_data['scaler']
+
+    # Test prediction
+    test_features = X_scaled[0:1]  # First sample
+    prediction = loaded_model.predict(test_features)
+    probabilities = loaded_model.predict_proba(test_features)
+
+    print(
+        f"Test prediction: {ACTIVITIES[prediction[0]]} (confidence: {np.max(probabilities):.3f})")
+    print("Model successfully saved and loaded!")
+
+    return model_path
+
+
+# Run this function to save your model
+model_path = save_best_ml_model()
