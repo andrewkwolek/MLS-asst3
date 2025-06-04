@@ -1,399 +1,437 @@
+import vggish_params
+from vggish_input import waveform_to_examples
+import pickle
 import numpy as np
 import sounddevice as sd
-import librosa
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-import pickle
+import matplotlib.animation as animation
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+from tkinter import ttk
+import threading
+import time
+import queue
+import librosa
+from collections import deque
 import tensorflow as tf
 from tensorflow.keras.models import load_model
-import time
-import threading
-from collections import deque
 import sys
 import os
-from sklearn.preprocessing import StandardScaler
 
-# VGGish imports (for DL model - same as Assignment 2)
-try:
-    import vggish_params
-    from vggish_input import waveform_to_examples
-except ImportError:
-    print("Warning: VGGish modules not found. DL model may not work correctly.")
-    print("Make sure vggish_input.py and vggish_params.py are in your directory.")
-
-# Configuration
-SAMPLE_RATE = 16000
-WINDOW_LENGTH = 1.0  # 1 second windows
-HOP_LENGTH = 0.5     # 0.5 second overlap
-BUFFER_SIZE = int(WINDOW_LENGTH * SAMPLE_RATE)
-HOP_SIZE = int(HOP_LENGTH * SAMPLE_RATE)
-
-# Activity labels (same as from assignments 1&2)
-ACTIVITIES = ['laugh', 'cough', 'clap', 'knock', 'alarm']
+# Add the vggish modules to path (assuming they're in the same directory)
+sys.path.append('.')
 
 
-class RealTimeAudioProcessor:
-    def __init__(self, ml_model_path, dl_model_path):
-        """Initialize the real-time audio processor with both models."""
+class RealtimeAudioClassifier:
+    def __init__(self):
+        # Audio parameters
+        self.sample_rate = 16000
+        self.window_length = 1.0  # 1 second windows
+        self.hop_length = 0.5     # 0.5 second overlap
+        self.buffer_size = int(self.window_length * self.sample_rate)
+        self.hop_size = int(self.hop_length * self.sample_rate)
+
+        # Data buffers
+        # Keep extra for overlap
+        self.audio_buffer = deque(maxlen=self.buffer_size * 2)
+        self.audio_queue = queue.Queue()
+
+        # Activities from assignments
+        self.activities = ['laugh', 'cough', 'clap', 'knock', 'alarm']
+
+        # Ubicoustics mapping for DL model
+        self.ubicoustics_mapping = {
+            'laugh': 'laugh',
+            'cough': 'cough',
+            'knock': 'knock',
+            'hazard-alarm': 'alarm',
+            'knock': 'clap'  # Map clap to knock as closest match
+        }
 
         # Load models
-        print("Loading ML model...")
-        with open(ml_model_path, 'rb') as f:
-            ml_data = pickle.load(f)
+        self.load_models()
 
-        # Handle different ML model save formats
-        if isinstance(ml_data, dict):
-            self.ml_model = ml_data.get('model', ml_data.get('best_model'))
-            self.ml_scaler = ml_data.get('scaler', None)
-            print(f"Loaded ML model from dict with keys: {ml_data.keys()}")
-        else:
-            self.ml_model = ml_data
-            self.ml_scaler = None
+        # GUI setup
+        self.setup_gui()
 
-        print("Loading DL model...")
-        self.dl_model = load_model(dl_model_path)
+        # Prediction history for display
+        self.ml_predictions = []
+        self.dl_predictions = []
+        self.ml_confidences = []
+        self.dl_confidences = []
+        self.ml_latencies = []
+        self.dl_latencies = []
 
-        # Audio buffer for sliding windows
-        # Store extra for overlap
-        self.audio_buffer = deque(maxlen=BUFFER_SIZE * 2)
+        # Audio stream
+        self.stream = None
+        self.is_running = False
 
-        # Results storage
-        self.ml_predictions = deque(maxlen=50)
-        self.dl_predictions = deque(maxlen=50)
-        self.ml_confidences = deque(maxlen=50)
-        self.dl_confidences = deque(maxlen=50)
-        self.ml_latencies = deque(maxlen=50)
-        self.dl_latencies = deque(maxlen=50)
-        self.timestamps = deque(maxlen=50)
-
-        # Current window data for visualization
-        self.current_window = np.zeros(BUFFER_SIZE)
-
-        # Initialize plot
-        self.setup_plot()
-
-        print("Real-time audio processor initialized successfully!")
-
-    def extract_ml_features(self, audio_signal, sr=16000):
-        """Extract features for ML model (same as from Assignment 1)."""
-
-        def extract_fft(audio_signal, sr=16000):
-            windowed_signal = audio_signal * \
-                librosa.filters.get_window('hann', len(audio_signal))
-            stft = librosa.stft(windowed_signal)
-            magnitude_spectrum = np.abs(stft)
-            power_spectrum = magnitude_spectrum ** 2
-            freq_bins = librosa.fft_frequencies(
-                sr=sr, n_fft=2*(stft.shape[0]-1))
-
-            total_energy = np.sum(power_spectrum)
-            spectral_centroid = librosa.feature.spectral_centroid(
-                S=power_spectrum, sr=sr)[0, 0]
-            spectral_spread = librosa.feature.spectral_bandwidth(
-                S=power_spectrum, sr=sr)[0, 0]
-            spectral_rolloff = librosa.feature.spectral_rolloff(
-                S=power_spectrum, sr=sr)[0, 0]
-
-            bands = [(0, 500), (500, 1000), (1000, 2000),
-                     (2000, 4000), (4000, 8000)]
-            band_energies = []
-            for low, high in bands:
-                indices = np.where((freq_bins >= low) & (freq_bins < high))[0]
-                if len(indices) > 0 and total_energy > 0:
-                    band_energy = np.sum(
-                        power_spectrum[indices]) / total_energy
-                else:
-                    band_energy = 0
-                band_energies.append(band_energy)
-
-            features = np.array([total_energy, spectral_centroid,
-                                spectral_spread, spectral_rolloff, *band_energies])
-            return features
-
-        def extract_mfcc(audio_signal, sr=16000):
-            mfccs = librosa.feature.mfcc(y=audio_signal, sr=sr, n_mfcc=13)
-            delta_mfccs = librosa.feature.delta(mfccs)
-            delta2_mfccs = librosa.feature.delta(mfccs, order=2)
-
-            mfcc_means = np.mean(mfccs, axis=1)
-            delta_means = np.mean(delta_mfccs, axis=1)
-            delta2_means = np.mean(delta2_mfccs, axis=1)
-            mfcc_stds = np.std(mfccs, axis=1)
-
-            selected_features = np.array([
-                mfcc_means[0], mfcc_means[1], mfcc_means[2], mfcc_stds[0],
-                delta_means[0], delta_means[1], delta2_means[0],
-                np.mean(mfcc_means), np.mean(mfcc_stds)
-            ])
-            return selected_features
-
-        def extract_rms(audio_signal, sr=16000):
-            rms_energy = librosa.feature.rms(y=audio_signal)[0]
-            rms_mean = np.mean(rms_energy)
-            rms_std = np.std(rms_energy)
-            rms_max = np.max(rms_energy)
-            rms_min = np.min(rms_energy)
-            rms_median = np.median(rms_energy)
-            rms_range = rms_max - rms_min
-
-            rms_diff = np.diff(rms_energy)
-            rms_diff_mean = np.mean(np.abs(rms_diff))
-            zcr = librosa.feature.zero_crossing_rate(audio_signal)[0]
-            zcr_mean = np.mean(zcr)
-            low_energy_ratio = np.mean(rms_energy < rms_mean)
-
-            features = np.array([rms_mean, rms_std, rms_max, rms_min, rms_median,
-                                 rms_range, rms_diff_mean, zcr_mean, low_energy_ratio])
-            return features
-
-        # Extract all features and combine
-        fft_features = extract_fft(audio_signal, sr)
-        mfcc_features = extract_mfcc(audio_signal, sr)
-        rms_features = extract_rms(audio_signal, sr)
-
-        combined_features = np.concatenate(
-            [fft_features, mfcc_features, rms_features])
-        return combined_features.reshape(1, -1)  # Reshape for sklearn
-
-    def extract_dl_features(self, audio_signal, sr=16000):
-        """Extract features for DL model using VGGish format (same as Assignment 2)."""
+    def load_models(self):
+        """Load both ML and DL models"""
         try:
-            # Use VGGish preprocessing (same as Assignment 2)
-            # Resample to VGGish sample rate if necessary
-            if sr != 16000:
-                audio_signal = librosa.resample(
-                    audio_signal, orig_sr=sr, target_sr=16000)
+            # Load ML model (from Assignment 1)
+            print("Loading ML model...")
+            with open('ml_model.pkl', 'rb') as f:
+                ml_data = pickle.load(f)
+            self.ml_model = ml_data['model']
+            self.ml_scaler = ml_data['scaler']
+            print("ML model loaded successfully")
 
-            # Convert to VGGish examples format
-            examples = waveform_to_examples(audio_signal, 16000)
-
-            if examples.shape[0] == 0:
-                print("Warning: No VGGish examples generated")
-                # Return a dummy input if no examples generated
-                return np.zeros((1, 96, 64, 1))
-
-            return examples
+            # Load DL model (from Assignment 2)
+            print("Loading DL model...")
+            self.dl_model = load_model('dl_model.h5', compile=False)
+            print("DL model loaded successfully")
 
         except Exception as e:
-            print(f"Error in DL feature extraction: {e}")
-            # Return a dummy input with correct shape if feature extraction fails
-            return np.zeros((1, 96, 64, 1))
+            print(f"Error loading models: {e}")
+            print(
+                "Please ensure ml_model.pkl and ubicoustics_model.h5 are in the current directory")
 
-    def predict_ml(self, features):
-        """Make prediction using ML model."""
+    def extract_ml_features(self, audio_signal):
+        """Extract features for ML model (same as in Assignment 1)"""
+        sr = self.sample_rate
+
+        # FFT features
+        windowed_signal = audio_signal * \
+            librosa.filters.get_window('hann', len(audio_signal))
+        stft = librosa.stft(windowed_signal)
+        magnitude_spectrum = np.abs(stft)
+        power_spectrum = magnitude_spectrum ** 2
+        freq_bins = librosa.fft_frequencies(sr=sr, n_fft=2*(stft.shape[0]-1))
+
+        total_energy = np.sum(power_spectrum)
+        spectral_centroid = librosa.feature.spectral_centroid(
+            S=power_spectrum, sr=sr)[0, 0]
+        spectral_spread = librosa.feature.spectral_bandwidth(
+            S=power_spectrum, sr=sr)[0, 0]
+        spectral_rolloff = librosa.feature.spectral_rolloff(
+            S=power_spectrum, sr=sr)[0, 0]
+
+        # Band energies
+        bands = [(0, 500), (500, 1000), (1000, 2000),
+                 (2000, 4000), (4000, 8000)]
+        band_energies = []
+        for low, high in bands:
+            indices = np.where((freq_bins >= low) & (freq_bins < high))[0]
+            if len(indices) > 0 and total_energy > 0:
+                band_energy = np.sum(power_spectrum[indices]) / total_energy
+            else:
+                band_energy = 0
+            band_energies.append(band_energy)
+
+        fft_features = np.array(
+            [total_energy, spectral_centroid, spectral_spread, spectral_rolloff, *band_energies])
+
+        # MFCC features
+        mfccs = librosa.feature.mfcc(y=audio_signal, sr=sr, n_mfcc=13)
+        delta_mfccs = librosa.feature.delta(mfccs)
+        delta2_mfccs = librosa.feature.delta(mfccs, order=2)
+
+        mfcc_means = np.mean(mfccs, axis=1)
+        delta_means = np.mean(delta_mfccs, axis=1)
+        delta2_means = np.mean(delta2_mfccs, axis=1)
+        mfcc_stds = np.std(mfccs, axis=1)
+
+        mfcc_features = np.array([
+            mfcc_means[0], mfcc_means[1], mfcc_means[2], mfcc_stds[0],
+            delta_means[0], delta_means[1], delta2_means[0],
+            np.mean(mfcc_means), np.mean(mfcc_stds)
+        ])
+
+        # RMS features
+        rms_energy = librosa.feature.rms(y=audio_signal)[0]
+        rms_mean = np.mean(rms_energy)
+        rms_std = np.std(rms_energy)
+        rms_max = np.max(rms_energy)
+        rms_min = np.min(rms_energy)
+        rms_median = np.median(rms_energy)
+        rms_range = rms_max - rms_min
+        rms_diff = np.diff(rms_energy)
+        rms_diff_mean = np.mean(np.abs(rms_diff))
+        zcr = librosa.feature.zero_crossing_rate(audio_signal)[0]
+        zcr_mean = np.mean(zcr)
+        low_energy_ratio = np.mean(rms_energy < rms_mean)
+
+        rms_features = np.array([rms_mean, rms_std, rms_max, rms_min, rms_median,
+                                rms_range, rms_diff_mean, zcr_mean, low_energy_ratio])
+
+        # Combine all features
+        features = np.concatenate([fft_features, mfcc_features, rms_features])
+        return features
+
+    def predict_ml(self, audio_signal):
+        """Make prediction using ML model"""
         start_time = time.time()
 
-        try:
-            # Apply scaling if scaler is available
-            if self.ml_scaler is not None:
-                features = self.ml_scaler.transform(features)
+        # Extract features
+        features = self.extract_ml_features(audio_signal)
+        features = features.reshape(1, -1)
 
-            # Get prediction and confidence
-            prediction = self.ml_model.predict(features)[0]
+        # Scale features
+        features_scaled = self.ml_scaler.transform(features)
 
-            # Get prediction probabilities if available
-            if hasattr(self.ml_model, 'predict_proba'):
-                confidence = self.ml_model.predict_proba(features)[0]
-                max_confidence = np.max(confidence)
-            else:
-                # For models without predict_proba, use decision function or default confidence
-                if hasattr(self.ml_model, 'decision_function'):
-                    decision_scores = self.ml_model.decision_function(features)[
-                        0]
-                    # Convert decision scores to confidence-like values
-                    exp_scores = np.exp(
-                        decision_scores - np.max(decision_scores))
-                    max_confidence = np.max(exp_scores) / np.sum(exp_scores)
-                else:
-                    max_confidence = 0.5  # Default confidence
+        # Predict
+        prediction = self.ml_model.predict(features_scaled)[0]
+        probabilities = self.ml_model.predict_proba(features_scaled)[0]
+        confidence = np.max(probabilities)
 
-            latency = (time.time() - start_time) * \
-                1000  # Convert to milliseconds
+        latency = (time.time() - start_time) * 1000  # Convert to ms
 
-            return ACTIVITIES[prediction], max_confidence, latency
+        return self.activities[prediction], confidence, latency
 
-        except Exception as e:
-            print(f"ML prediction error: {e}")
-            return "unknown", 0.0, 0.0
-
-    def predict_dl(self, features):
-        """Make prediction using DL model."""
+    def predict_dl(self, audio_signal):
+        """Make prediction using DL model"""
         start_time = time.time()
 
-        try:
-            # Get prediction - average across all windows if multiple examples
-            if features.shape[0] > 1:
-                # Multiple windows - average predictions
-                prediction_probs = self.dl_model.predict(features, verbose=0)
-                avg_pred = np.mean(prediction_probs, axis=0)
-            else:
-                # Single window
-                avg_pred = self.dl_model.predict(features, verbose=0)[0]
+        # Convert to VGGish input format
+        examples = waveform_to_examples(audio_signal, self.sample_rate)
 
-            predicted_class = np.argmax(avg_pred)
-            confidence = np.max(avg_pred)
+        if examples.shape[0] == 0:
+            return "silence", 0.0, 0.0
 
-            latency = (time.time() - start_time) * \
-                1000  # Convert to milliseconds
+        # Run prediction
+        predictions = self.dl_model.predict(examples, verbose=0)
+        avg_pred = np.mean(predictions, axis=0)
 
-            return ACTIVITIES[predicted_class], confidence, latency
+        # Get top prediction
+        top_class_idx = np.argmax(avg_pred)
+        confidence = avg_pred[top_class_idx]
 
-        except Exception as e:
-            print(f"DL prediction error: {e}")
-            return "unknown", 0.0, 0.0
+        # Map to our activities (simplified mapping)
+        # In a real implementation, you'd have the full Ubicoustics label mapping
+        activity_mapping = {0: 'laugh', 1: 'cough',
+                            2: 'alarm', 3: 'knock', 4: 'clap'}
+        predicted_activity = activity_mapping.get(top_class_idx % 5, 'unknown')
 
-    def process_window(self, audio_window):
-        """Process a single audio window with both models."""
+        latency = (time.time() - start_time) * 1000
 
-        # Extract features for both models
-        ml_features = self.extract_ml_features(audio_window, SAMPLE_RATE)
-        dl_features = self.extract_dl_features(audio_window, SAMPLE_RATE)
-
-        # Make predictions
-        ml_pred, ml_conf, ml_lat = self.predict_ml(ml_features)
-        dl_pred, dl_conf, dl_lat = self.predict_dl(dl_features)
-
-        # Store results
-        current_time = time.time()
-        self.timestamps.append(current_time)
-        self.ml_predictions.append(ml_pred)
-        self.dl_predictions.append(dl_pred)
-        self.ml_confidences.append(ml_conf)
-        self.dl_confidences.append(dl_conf)
-        self.ml_latencies.append(ml_lat)
-        self.dl_latencies.append(dl_lat)
-
-        # Print current predictions
-        print(f"ML: {ml_pred} (conf: {ml_conf:.3f}, lat: {ml_lat:.1f}ms) | "
-              f"DL: {dl_pred} (conf: {dl_conf:.3f}, lat: {dl_lat:.1f}ms)")
+        return predicted_activity, confidence, latency
 
     def audio_callback(self, indata, frames, time, status):
-        """Callback function for audio input."""
+        """Callback function for audio stream"""
         if status:
             print(f"Audio callback status: {status}")
 
-        # Add new audio data to buffer
-        audio_data = indata[:, 0]  # Take first channel if stereo
-        self.audio_buffer.extend(audio_data)
+        # Add audio data to buffer
+        audio_data = indata[:, 0]  # Get mono channel
+        self.audio_queue.put(audio_data.copy())
 
-        # Check if we have enough data for a window
-        if len(self.audio_buffer) >= BUFFER_SIZE:
-            # Extract current window
-            window_data = np.array(list(self.audio_buffer)[-BUFFER_SIZE:])
-            self.current_window = window_data
+    def process_audio(self):
+        """Process audio in separate thread"""
+        while self.is_running:
+            try:
+                # Get audio data from queue
+                if not self.audio_queue.empty():
+                    audio_chunk = self.audio_queue.get(timeout=0.1)
+                    self.audio_buffer.extend(audio_chunk)
 
-            # Process window in separate thread to avoid blocking audio callback
-            threading.Thread(target=self.process_window, args=(
-                window_data,), daemon=True).start()
+                    # Check if we have enough data for a window
+                    if len(self.audio_buffer) >= self.buffer_size:
+                        # Extract window
+                        window_data = np.array(
+                            list(self.audio_buffer)[-self.buffer_size:])
 
-    def setup_plot(self):
-        """Set up the matplotlib plot for real-time visualization."""
-        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 8))
+                        # Make predictions
+                        ml_pred, ml_conf, ml_lat = self.predict_ml(window_data)
+                        dl_pred, dl_conf, dl_lat = self.predict_dl(window_data)
 
-        # Waveform plot
-        self.line1, = self.ax1.plot([], [], 'b-')
-        self.ax1.set_xlim(0, BUFFER_SIZE)
-        self.ax1.set_ylim(-1, 1)
-        self.ax1.set_title('Real-time Audio Waveform (1 second window)')
-        self.ax1.set_xlabel('Samples')
-        self.ax1.set_ylabel('Amplitude')
-        self.ax1.grid(True)
+                        # Store results (keep last 10 predictions)
+                        self.ml_predictions.append(ml_pred)
+                        self.ml_confidences.append(ml_conf)
+                        self.ml_latencies.append(ml_lat)
+                        self.dl_predictions.append(dl_pred)
+                        self.dl_confidences.append(dl_conf)
+                        self.dl_latencies.append(dl_lat)
 
-        # Prediction text area
-        self.ax2.axis('off')
-        self.prediction_text = self.ax2.text(
-            0.1, 0.8, '', fontsize=14, family='monospace')
+                        if len(self.ml_predictions) > 10:
+                            self.ml_predictions.pop(0)
+                            self.ml_confidences.pop(0)
+                            self.ml_latencies.pop(0)
+                            self.dl_predictions.pop(0)
+                            self.dl_confidences.pop(0)
+                            self.dl_latencies.pop(0)
 
-        plt.tight_layout()
+                        # Update display
+                        self.update_display(
+                            window_data, ml_pred, ml_conf, ml_lat, dl_pred, dl_conf, dl_lat)
 
-    def update_plot(self, frame):
-        """Update the plot with current data."""
-        # Update waveform
-        if len(self.current_window) > 0:
-            self.line1.set_data(
-                range(len(self.current_window)), self.current_window)
+                        # Wait for hop time
+                        time.sleep(self.hop_length)
 
-        # Update prediction text
-        if len(self.ml_predictions) > 0 and len(self.dl_predictions) > 0:
-            ml_pred = self.ml_predictions[-1]
-            dl_pred = self.dl_predictions[-1]
-            ml_conf = self.ml_confidences[-1]
-            dl_conf = self.dl_confidences[-1]
-            ml_lat = self.ml_latencies[-1]
-            dl_lat = self.dl_latencies[-1]
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error in audio processing: {e}")
 
-            prediction_info = f"""
-ML Model (Assignment 1):
-  Prediction: {ml_pred}
-  Confidence: {ml_conf:.3f}
-  Latency: {ml_lat:.1f} ms
+    def setup_gui(self):
+        """Setup GUI for real-time display"""
+        self.root = tk.Tk()
+        self.root.title("Real-time Acoustic Activity Recognition")
+        self.root.geometry("1200x800")
 
-DL Model (Assignment 2):
-  Prediction: {dl_pred}
-  Confidence: {dl_conf:.3f}
-  Latency: {dl_lat:.1f} ms
+        # Create main frame
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-Update Rate: ~{1/HOP_LENGTH:.1f} FPS
-            """.strip()
+        # Audio waveform plot
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 6))
+        self.canvas = FigureCanvasTkAgg(self.fig, main_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-            self.prediction_text.set_text(prediction_info)
+        # Prediction display frame
+        pred_frame = ttk.LabelFrame(
+            main_frame, text="Real-time Predictions", padding=10)
+        pred_frame.pack(fill=tk.X, pady=(10, 0))
 
-        return self.line1, self.prediction_text
+        # ML predictions
+        ml_frame = ttk.LabelFrame(
+            pred_frame, text="ML Classifier (Assignment 1)", padding=5)
+        ml_frame.pack(fill=tk.X, pady=2)
 
-    def start_realtime_processing(self):
-        """Start the real-time audio processing."""
-        print("Starting real-time audio processing...")
-        print("Perform the 5 activities: laugh, cough, clap, knock, alarm")
-        print("Press Ctrl+C to stop")
+        self.ml_label_var = tk.StringVar(value="Activity: -")
+        self.ml_conf_var = tk.StringVar(value="Confidence: -")
+        self.ml_lat_var = tk.StringVar(value="Latency: -")
 
+        ttk.Label(ml_frame, textvariable=self.ml_label_var,
+                  font=("Arial", 12, "bold")).pack(anchor=tk.W)
+        ttk.Label(ml_frame, textvariable=self.ml_conf_var).pack(anchor=tk.W)
+        ttk.Label(ml_frame, textvariable=self.ml_lat_var).pack(anchor=tk.W)
+
+        # DL predictions
+        dl_frame = ttk.LabelFrame(
+            pred_frame, text="DL Classifier (Assignment 2)", padding=5)
+        dl_frame.pack(fill=tk.X, pady=2)
+
+        self.dl_label_var = tk.StringVar(value="Activity: -")
+        self.dl_conf_var = tk.StringVar(value="Confidence: -")
+        self.dl_lat_var = tk.StringVar(value="Latency: -")
+
+        ttk.Label(dl_frame, textvariable=self.dl_label_var,
+                  font=("Arial", 12, "bold")).pack(anchor=tk.W)
+        ttk.Label(dl_frame, textvariable=self.dl_conf_var).pack(anchor=tk.W)
+        ttk.Label(dl_frame, textvariable=self.dl_lat_var).pack(anchor=tk.W)
+
+        # Control buttons
+        control_frame = ttk.Frame(main_frame)
+        control_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.start_button = ttk.Button(
+            control_frame, text="Start Recording", command=self.start_recording)
+        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.stop_button = ttk.Button(
+            control_frame, text="Stop Recording", command=self.stop_recording, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT)
+
+        # Status label
+        self.status_var = tk.StringVar(value="Ready to start")
+        ttk.Label(control_frame, textvariable=self.status_var).pack(
+            side=tk.RIGHT)
+
+    def update_display(self, audio_data, ml_pred, ml_conf, ml_lat, dl_pred, dl_conf, dl_lat):
+        """Update GUI display with new predictions"""
+        # Update prediction labels
+        self.ml_label_var.set(f"Activity: {ml_pred.upper()}")
+        self.ml_conf_var.set(f"Confidence: {ml_conf:.3f}")
+        self.ml_lat_var.set(f"Latency: {ml_lat:.1f} ms")
+
+        self.dl_label_var.set(f"Activity: {dl_pred.upper()}")
+        self.dl_conf_var.set(f"Confidence: {dl_conf:.3f}")
+        self.dl_lat_var.set(f"Latency: {dl_lat:.1f} ms")
+
+        # Update waveform plot
+        self.ax1.clear()
+        time_axis = np.linspace(0, self.window_length, len(audio_data))
+        self.ax1.plot(time_axis, audio_data, 'b-', linewidth=0.5)
+        self.ax1.set_title("Audio Waveform (Current Window)")
+        self.ax1.set_xlabel("Time (s)")
+        self.ax1.set_ylabel("Amplitude")
+        self.ax1.grid(True, alpha=0.3)
+
+        # Update confidence plot
+        self.ax2.clear()
+        if len(self.ml_confidences) > 1:
+            self.ax2.plot(range(len(self.ml_confidences)),
+                          self.ml_confidences, 'b-o', label='ML Model', markersize=4)
+            self.ax2.plot(range(len(self.dl_confidences)),
+                          self.dl_confidences, 'r-s', label='DL Model', markersize=4)
+            self.ax2.set_title("Prediction Confidence Over Time")
+            self.ax2.set_xlabel("Window Number")
+            self.ax2.set_ylabel("Confidence")
+            self.ax2.legend()
+            self.ax2.grid(True, alpha=0.3)
+            self.ax2.set_ylim(0, 1)
+
+        self.canvas.draw()
+
+    def start_recording(self):
+        """Start audio recording and processing"""
         try:
+            self.is_running = True
+
             # Start audio stream
-            with sd.InputStream(
-                callback=self.audio_callback,
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
                 channels=1,
-                samplerate=SAMPLE_RATE,
-                blocksize=HOP_SIZE,
-                dtype=np.float32
-            ):
-                # Start animation
-                self.animation = FuncAnimation(
-                    self.fig,
-                    self.update_plot,
-                    # Update every hop_length seconds
-                    interval=int(HOP_LENGTH * 1000),
-                    blit=False
-                )
+                callback=self.audio_callback,
+                blocksize=self.hop_size
+            )
+            self.stream.start()
 
-                plt.show()
+            # Start processing thread
+            self.processing_thread = threading.Thread(
+                target=self.process_audio)
+            self.processing_thread.daemon = True
+            self.processing_thread.start()
 
-        except KeyboardInterrupt:
-            print("\nStopping real-time processing...")
+            # Update GUI
+            self.start_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.NORMAL)
+            self.status_var.set("Recording and classifying...")
+
         except Exception as e:
-            print(f"Error in real-time processing: {e}")
+            print(f"Error starting recording: {e}")
+            self.status_var.set(f"Error: {e}")
 
+    def stop_recording(self):
+        """Stop audio recording and processing"""
+        self.is_running = False
 
-def main():
-    """Main function to run the real-time audio recognition system."""
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
 
-    # Model paths - adjust these to match your saved models
-    ml_model_path = "ml_model.pkl"
-    dl_model_path = "dl_model.h5"
+        # Update GUI
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.status_var.set("Stopped")
 
-    # Check if model files exist
-    if not os.path.exists(ml_model_path):
-        print(f"Error: ML model file '{ml_model_path}' not found!")
-        print("Please ensure your ML model from Assignment 1 is saved as 'ml_model.pkl'")
-        return
+    def run(self):
+        """Run the application"""
+        print("Real-time Acoustic Activity Recognition System")
+        print("Activities: laugh, cough, clap, knock, alarm")
+        print("Window size: 1 second with 0.5 second overlap")
+        print("Click 'Start Recording' to begin...")
 
-    if not os.path.exists(dl_model_path):
-        print(f"Error: DL model file '{dl_model_path}' not found!")
-        print("Please ensure your DL model from Assignment 2 is saved as 'dl_model.h5'")
-        return
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.mainloop()
 
-    # Create and start the real-time processor
-    processor = RealTimeAudioProcessor(ml_model_path, dl_model_path)
-    processor.start_realtime_processing()
+    def on_closing(self):
+        """Handle application closing"""
+        self.stop_recording()
+        self.root.destroy()
 
 
 if __name__ == "__main__":
-    main()
+    # Check if required files exist
+    if not os.path.exists('ml_model.pkl'):
+        print("Error: ml_model.pkl not found. Please ensure you have the ML model from Assignment 1.")
+        exit(1)
+
+    if not os.path.exists('dl_model.h5'):
+        print("Error: ubicoustics_model.h5 not found. Please ensure you have the DL model from Assignment 2.")
+        exit(1)
+
+    # Create and run the application
+    app = RealtimeAudioClassifier()
+    app.run()
